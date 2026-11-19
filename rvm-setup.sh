@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  rvm-setup.sh  -  one-command setup for RVM (ruvnet's microhypervisor)
-#  on a fresh Ubuntu machine or VM.
+#  rvm-setup.sh - set up RVM (ruvnet's microhypervisor) on a fresh
+#  Ubuntu machine with one command, then prove it boots.
 #
-#  What it does, in order:
-#    1. Installs system packages (C compiler, git, make, QEMU for ARM)
-#    2. Installs Rust (rustup) without asking questions
-#    3. Adds the ARM target and tools Rust needs to build RVM
-#    4. Clones RVM and the two submodules it needs (ruvector, rudevolution)
-#    5. Fixes the kernel stack size in rvm.ld (64 KB -> 2 MB)
-#    6. Builds the kernel and copies it to the filename the Makefile expects
-#    7. Boots it once in QEMU (hidden) and checks it reached the scheduler
-#    8. Adds a short command, rvm-boot, so you can watch it boot yourself
+#  Built by following RVM's own quick-start guide on a blank Ubuntu
+#  26.04 and fixing every error that came up. Each fix is marked
+#  "(fix N)" and explained where it happens.
 #
-#  Safe to run again: steps that are already done are skipped.
-#  Settings you can change:  RVM_DIR (default ~/rvm)
+#  Steps:
+#    0. Pre-flight checks (user, Ubuntu, sudo, disk space, internet)
+#    1. System packages            (fixes 2, 3, 4, 5)
+#    2. Rust                       (fix 1)
+#    3. ARM target and Rust tools
+#    4. RVM source and submodules  (fixes 6, 7)
+#    5. Run RVM's test suite       (skip with RVM_SKIP_TESTS=1)
+#    6. Stack size fix             (fixes 9, 10)
+#    7. Build the kernel
+#    8. Test boot at EL2           (fixes 8, 11)
+#    9. Shortcut command: rvm-boot
+#
+#  Safe to run again: finished steps are skipped or re-checked.
+#  Settings:  RVM_DIR (default ~/rvm),  RVM_SKIP_TESTS=1
 # =====================================================================
 
 main() {
@@ -22,57 +28,75 @@ main() {
 
   RVM_DIR="${RVM_DIR:-$HOME/rvm}"
   TARGET="aarch64-unknown-none"
-  KDIR="$RVM_DIR/target/$TARGET/release"
-  STEP=""
+  KERNEL="$RVM_DIR/target/$TARGET/release/rvm"
+  MACHINE="virt,virtualization=on"
+  STEP="0/9"
 
   say()  { printf '\n\033[1;36m[%s] %s\033[0m\n' "$STEP" "$1"; }
   why()  { printf '      \033[2m%s\033[0m\n' "$1"; }
   ok()   { printf '      \033[1;32mOK\033[0m %s\n' "$1"; }
-  warn() { printf '      \033[1;33mNOTE\033[0m %s\n' "$1"; }
+  fail() { printf '      \033[1;31mFAILED\033[0m %s\n' "$1"; exit 1; }
+  need() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is still missing after this step"; }
   trap 'printf "\n\033[1;31mStopped at step %s. Scroll up for the error.\033[0m\n" "$STEP"' ERR
 
-  if [ "$(id -u)" -eq 0 ]; then
-    echo "Run this as your normal user (not with sudo). It asks for your password when needed."
-    exit 1
+  # ---------------------------------------------------------------
+  say "Pre-flight checks"
+  [ "$(id -u)" -ne 0 ] || fail "run as your normal user, not with sudo. It asks for your password when needed."
+  if grep -qi ubuntu /etc/os-release 2>/dev/null; then
+    ok "$(grep '^PRETTY_NAME=' /etc/os-release | cut -d'"' -f2)"
+  else
+    printf '      NOTE not Ubuntu; continuing, but this was only tested on Ubuntu\n'
   fi
+  sudo -v || fail "sudo didn't work for this user"
+  ok "sudo works"
+  free_gb=$(df -Pk "$HOME" | awk 'NR==2 {print int($4/1048576)}')
+  [ "$free_gb" -ge 10 ] || fail "only ${free_gb} GB free in your home folder; about 10 GB is needed"
+  ok "${free_gb} GB free"
 
   # ---------------------------------------------------------------
-  STEP="1/8"; say "System packages"
-  why "build-essential = C compiler and linker. QEMU = pretend ARM computer to run RVM on."
+  STEP="1/9"; say "System packages"
+  why "(fix 3) curl downloads the Rust installer. (fix 4) build-essential is the C linker Rust needs."
+  why "(fix 5) git downloads RVM. (fix 2) Ubuntu's ARM QEMU package is qemu-system-arm."
   sudo apt-get update
-  QEMU_PKG=qemu-system-arm
-  apt-cache show qemu-system-arm >/dev/null 2>&1 || QEMU_PKG=qemu-system-aarch64
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    build-essential curl git make unzip ca-certificates "$QEMU_PKG" </dev/null
+    curl ca-certificates build-essential git qemu-system-arm </dev/null
+  for t in curl cc make git qemu-system-aarch64; do need "$t"; done
+  ok "curl, cc, make, git: present"
   ok "$(qemu-system-aarch64 --version | head -1)"
 
   # ---------------------------------------------------------------
-  STEP="2/8"; say "Rust"
-  why "RVM is written in Rust. rustup installs and manages Rust versions."
-  if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+  STEP="2/9"; say "Rust"
+  why "(fix 1) The guide assumes Rust is installed. This uses the official installer from rustup.rs."
+  # shellcheck disable=SC1091
+  if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+  if ! command -v rustup >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
   else
     ok "rustup already installed"
   fi
-  # shellcheck disable=SC1091
-  . "$HOME/.cargo/env"
-  ok "$(rustc --version)"
+  need rustc; need cargo
+  rv=$(rustc --version | awk '{print $2}')
+  [ "$(printf '%s\n' 1.77.0 "$rv" | sort -V | head -1)" = 1.77.0 ] || fail "Rust $rv is older than the 1.77 RVM needs; run: rustup update stable"
+  ok "Rust $rv (RVM needs 1.77 or newer)"
 
   # ---------------------------------------------------------------
-  STEP="3/8"; say "ARM target and Rust tools"
-  why "Your PC is x86. RVM runs on ARM (aarch64), so Rust needs the ARM 'bare metal' target."
+  STEP="3/9"; say "ARM target and Rust tools"
+  why "Your PC is x86; RVM runs on ARM, so Rust needs the bare-metal ARM target."
   rustup target add "$TARGET"
   rustup component add llvm-tools
   if ! command -v rust-objcopy >/dev/null 2>&1; then
-    why "cargo-binutils gives 'make bin' and 'make objdump'. Compiling it takes a few minutes."
+    why "cargo-binutils is used by 'make bin' and 'make objdump'. It compiles for a few minutes."
     cargo install --locked cargo-binutils
-  else
-    ok "cargo-binutils already installed"
   fi
+  need rust-objcopy
+  ok "target $TARGET, llvm-tools, cargo-binutils"
 
   # ---------------------------------------------------------------
-  STEP="4/8"; say "Get RVM source"
-  why "Plain clone, then only the submodules RVM needs. The cuda-wasm submodule is broken upstream."
+  STEP="4/9"; say "RVM source and submodules"
+  why "(fix 7) '--recurse-submodules' fails: a submodule nested inside cuda-wasm has no URL."
+  why "(fix 6) A plain clone alone misses ruvector, which the build needs. So: plain clone, then the two needed submodules."
   if [ ! -d "$RVM_DIR/.git" ]; then
     git clone https://github.com/ruvnet/rvm.git "$RVM_DIR"
   else
@@ -80,74 +104,78 @@ main() {
   fi
   cd "$RVM_DIR"
   git submodule update --init ruvector rudevolution
-  ok "ruvector and rudevolution checked out (the kernel build reads code from ruvector)"
+  [ -f ruvector/crates/ruvector-context/Cargo.toml ] || fail "ruvector submodule is incomplete"
+  ok "RVM $(git log -1 --format=%h), ruvector and rudevolution at their pinned versions"
 
   # ---------------------------------------------------------------
-  STEP="5/8"; say "Stack size fix in rvm.ld"
-  why "rvm_main needs about 94 KB of stack but rvm.ld only gives 64 KB, so it crashed silently."
-  if grep -q '+ 0x200000' rvm.ld; then
+  STEP="5/9"; say "RVM's test suite"
+  if [ "${RVM_SKIP_TESTS:-0}" = 1 ]; then
+    ok "skipped (RVM_SKIP_TESTS=1)"
+  else
+    why "Runs RVM's library tests on your PC to check the source is healthy. Takes a few minutes."
+    TLOG="$RVM_DIR/test-run.log"
+    cargo test --workspace --lib >"$TLOG" 2>&1 || fail "tests failed; see $TLOG"
+    read -r passed failed < <(awk '/^test result/ {p+=$4; f+=$6} END {print p+0, f+0}' "$TLOG")
+    [ "$failed" -eq 0 ] || fail "$failed tests failed; see $TLOG"
+    ok "$passed tests passed, 0 failed"
+  fi
+
+  # ---------------------------------------------------------------
+  STEP="6/9"; say "Stack size fix in rvm.ld"
+  why "(fix 9) rvm_main needs about 371 KB of stack, but rvm.ld gives 64 KB. The stack runs off the"
+  why "bottom of RAM and the kernel dies silently. This gives it 1 MB."
+  if grep -q '+ 0x100000;' rvm.ld; then
     ok "already fixed"
-  elif grep -q '+ 0x10000' rvm.ld; then
-    sed -i 's/+ 0x10000/+ 0x200000/' rvm.ld
-    touch crates/rvm-kernel/src/main.rs
-    ok "stack is now 2 MB (0x200000)"
+  elif grep -q '+ 0x10000;' rvm.ld; then
+    sed -i 's/+ 0x10000;/+ 0x100000;/' rvm.ld
+    ok "stack is now 1 MB (0x100000)"
   else
-    warn "rvm.ld has changed upstream; the stack line wasn't found. Continuing anyway."
+    printf '      NOTE rvm.ld changed upstream; stack line not found. Continuing.\n'
   fi
+  # (fix 10) cargo doesn't notice rvm.ld edits; touching the kernel makes it relink.
+  touch crates/rvm-kernel/src/main.rs
 
   # ---------------------------------------------------------------
-  STEP="6/8"; say "Build the kernel"
-  why "Compiles RVM for ARM. The first build takes a while."
+  STEP="7/9"; say "Build the kernel"
   make build
-  cp "$KDIR/rvm" "$KDIR/rvm-kernel"
-  ok "kernel: $KDIR/rvm  (copied to rvm-kernel for the Makefile)"
+  [ -f "$KERNEL" ] || fail "no kernel at $KERNEL"
+  ok "kernel built: $KERNEL"
 
   # ---------------------------------------------------------------
-  STEP="7/8"; say "Test boot (hidden, 8 seconds)"
-  why "Boots RVM with virtualization=on, so it starts at EL2 (hypervisor level), and saves its output."
-  LOG="$RVM_DIR/boot-test.log"
-  timeout 8 qemu-system-aarch64 -M virt,virtualization=on -cpu cortex-a72 -m 128M \
-    -display none -monitor none -serial "file:$LOG" -kernel "$KDIR/rvm" </dev/null 2>/dev/null || true
-  sed 's/^/      | /' "$LOG"
-  if grep -q 'Entering scheduler loop' "$LOG"; then
-    ok "RVM booted and reached its scheduler loop"
-    BOOT_OK=1
-  else
-    warn "RVM did not reach the scheduler loop. Output above, also saved in $LOG"
-    BOOT_OK=0
-  fi
+  STEP="8/9"; say "Test boot (hidden, 8 seconds)"
+  why "(fix 8) The build makes 'rvm', not the 'rvm-kernel' that 'make run' expects, so the path is given directly."
+  why "(fix 11) At EL1 the kernel hits an undefined instruction; virtualization=on starts it at EL2."
+  BLOG="$RVM_DIR/boot-test.log"
+  timeout 8 qemu-system-aarch64 -M "$MACHINE" -cpu cortex-a72 -m 128M \
+    -display none -monitor none -serial "file:$BLOG" -kernel "$KERNEL" </dev/null 2>/dev/null || true
+  sed 's/^/      | /' "$BLOG"
+  grep -q 'Exception level: EL2' "$BLOG" || fail "did not reach EL2; output saved in $BLOG"
+  grep -q 'Entering scheduler loop' "$BLOG" || fail "did not reach the scheduler loop; output saved in $BLOG"
+  ok "RVM booted at EL2 and reached its scheduler loop"
 
   # ---------------------------------------------------------------
-  STEP="8/8"; say "Shortcut command: rvm-boot"
+  STEP="9/9"; say "Shortcut command: rvm-boot"
   MARK="# rvm-setup: rvm-boot shortcut"
-  if ! grep -qF "$MARK" "$HOME/.bashrc"; then
-    {
-      echo ""
-      echo "$MARK"
-      echo "alias rvm-boot='qemu-system-aarch64 -M virt,virtualization=on -cpu cortex-a72 -m 128M -nographic -kernel $KDIR/rvm'"
-    } >> "$HOME/.bashrc"
+  if ! grep -qF "$MARK" "$HOME/.bashrc" 2>/dev/null; then
+    printf '\n%s\nalias rvm-boot='"'"'make -C %s run KERNEL_ELF=%s QEMU_MACHINE=%s'"'"'\n' \
+      "$MARK" "$RVM_DIR" "$KERNEL" "$MACHINE" >> "$HOME/.bashrc"
     ok "added to ~/.bashrc"
   else
     ok "already in ~/.bashrc"
   fi
 
   trap - ERR
-  echo ""
-  if [ "$BOOT_OK" = 1 ]; then
-    printf '\033[1;32mDone. RVM is built and boots.\033[0m\n'
-  else
-    printf '\033[1;33mSetup finished, but the test boot did not pass.\033[0m\n'
-  fi
+  printf '\n\033[1;32mDone. RVM is set up, tested and boots.\033[0m\n'
   cat <<EOF
 
 Next:
-  1. Close this terminal and open a new one (loads Rust and the shortcut).
+  1. Open a new terminal (it loads Rust and the shortcut).
   2. Type:  rvm-boot
   3. To quit QEMU: press Ctrl+A, let go, then press X.
 
-It stops at "Entering scheduler loop..." on purpose: nothing is loaded into RVM yet.
+RVM stops at "Entering scheduler loop..." on purpose: nothing is loaded into it yet.
 EOF
 }
 
-# Everything runs from main(), so a half-downloaded script does nothing.
+# Everything runs inside main(), so a half-downloaded script does nothing.
 main "$@"
